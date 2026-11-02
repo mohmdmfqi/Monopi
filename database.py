@@ -1,5 +1,6 @@
 import logging
 import os
+import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -370,6 +371,46 @@ def init_db():
                 FOREIGN KEY (telegram_id)
                 REFERENCES users(telegram_id)
                 ON DELETE CASCADE
+            )
+        """)
+
+        # =================================================
+        # INVITES
+        # =================================================
+        # One row per invitation link an admin creates for a
+        # specific person: who they are (invited_name), what they
+        # do (job_title) and the one question they must answer the
+        # first time they open the bot through the link. The
+        # answer lives on the same row -- one link, one person, one
+        # answer. `code` is what goes after ?start= in the Telegram
+        # deep link (random, so links can't be guessed).
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS invites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+
+                code TEXT UNIQUE NOT NULL,
+
+                invited_name TEXT NOT NULL,
+
+                job_title TEXT NOT NULL,
+
+                question TEXT NOT NULL,
+
+                is_active INTEGER NOT NULL DEFAULT 1,
+
+                created_by INTEGER NOT NULL,
+
+                created_at TIMESTAMP
+                DEFAULT CURRENT_TIMESTAMP,
+
+                opened_count INTEGER NOT NULL DEFAULT 0,
+
+                answered_by INTEGER,
+
+                answer TEXT,
+
+                answered_at TIMESTAMP
             )
         """)
 
@@ -1634,6 +1675,180 @@ def get_collaboration_ratings(
         ))
 
         return cursor.fetchall()
+
+
+# =========================================================
+# INVITES  (admin-created links with a question for one person)
+# =========================================================
+
+INVITE_CODE_PREFIX = "inv_"
+
+
+def create_invite(
+    created_by,
+    invited_name,
+    job_title,
+    question
+):
+    """
+    Creates an invite and returns (invite_id, code). The code is
+    random and short enough for Telegram's 64-character limit on
+    the /start parameter (letters, digits, "_" and "-" only).
+    """
+
+    for _ in range(5):
+
+        code = INVITE_CODE_PREFIX + secrets.token_urlsafe(6)
+
+        try:
+
+            with get_connection() as conn:
+
+                cursor = conn.execute("""
+                    INSERT INTO invites (
+                        code,
+                        invited_name,
+                        job_title,
+                        question,
+                        created_by
+                    )
+
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    code,
+                    invited_name,
+                    job_title,
+                    question,
+                    created_by
+                ))
+
+                return cursor.lastrowid, code
+
+        except sqlite3.IntegrityError:
+
+            # astronomically unlikely code collision -- retry
+            continue
+
+    raise RuntimeError("Could not generate a unique invite code")
+
+
+def get_invite(invite_id):
+
+    with get_connection() as conn:
+
+        cursor = conn.execute("""
+            SELECT *
+            FROM invites
+            WHERE id = ?
+        """, (
+            invite_id,
+        ))
+
+        return cursor.fetchone()
+
+
+def get_invite_by_code(code):
+
+    with get_connection() as conn:
+
+        cursor = conn.execute("""
+            SELECT *
+            FROM invites
+            WHERE code = ?
+        """, (
+            code,
+        ))
+
+        return cursor.fetchone()
+
+
+def increment_invite_opens(invite_id):
+
+    with get_connection() as conn:
+
+        conn.execute("""
+            UPDATE invites
+            SET opened_count = opened_count + 1
+            WHERE id = ?
+        """, (
+            invite_id,
+        ))
+
+
+def count_invites():
+
+    with get_connection() as conn:
+
+        return conn.execute(
+            "SELECT COUNT(*) FROM invites"
+        ).fetchone()[0]
+
+
+def list_invites(
+    limit=5,
+    offset=0
+):
+    """Newest first."""
+
+    with get_connection() as conn:
+
+        cursor = conn.execute("""
+            SELECT *
+            FROM invites
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+        """, (
+            limit,
+            offset
+        ))
+
+        return cursor.fetchall()
+
+
+def save_invite_answer(
+    invite_id,
+    telegram_id,
+    answer
+):
+    """
+    Stores the answer only if the invite hasn't been answered yet
+    (first answer wins). Returns True if this call saved it.
+    """
+
+    with get_connection() as conn:
+
+        cursor = conn.execute("""
+            UPDATE invites
+            SET
+                answer = ?,
+                answered_by = ?,
+                answered_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND answer IS NULL
+        """, (
+            answer,
+            telegram_id,
+            invite_id
+        ))
+
+        return cursor.rowcount > 0
+
+
+def set_invite_active(
+    invite_id,
+    is_active
+):
+
+    with get_connection() as conn:
+
+        conn.execute("""
+            UPDATE invites
+            SET is_active = ?
+            WHERE id = ?
+        """, (
+            1 if is_active else 0,
+            invite_id
+        ))
 
 
 # =========================================================
