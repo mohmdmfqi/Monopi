@@ -1,4 +1,5 @@
 import asyncio
+import html
 import logging
 import os
 import shutil
@@ -6,14 +7,14 @@ import signal
 import sys
 import tempfile
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import (
     TelegramForbiddenError,
     TelegramUnauthorizedError,
 )
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandObject, CommandStart
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -95,6 +96,17 @@ from database import (
     # Admin dashboard
     get_admin_stats,
     get_all_collaborations,
+
+    # Invite links (admin-created, one question per person)
+    INVITE_CODE_PREFIX,
+    create_invite,
+    get_invite,
+    get_invite_by_code,
+    increment_invite_opens,
+    count_invites,
+    list_invites,
+    save_invite_answer,
+    set_invite_active,
 )
 
 
@@ -743,6 +755,11 @@ def admin_menu():
     )
 
     builder.button(
+        text="🔗 لینک‌های دعوت",
+        callback_data="admin_invites"
+    )
+
+    builder.button(
         text="📊 آمار",
         callback_data="admin_stats"
     )
@@ -768,11 +785,179 @@ def admin_menu():
 
 
 # =========================================================
+# INVITE LINKS — shared helpers
+# =========================================================
+# An admin creates a link for one person (name + job title + one
+# question). The person opens https://t.me/<bot>?start=inv_xxxx,
+# must answer the question first, and only then continues to the
+# normal bot. Everything lives in the `invites` table.
+
+MAX_INVITE_NAME = 60
+MAX_INVITE_JOB = 60
+MAX_INVITE_QUESTION = 500
+MIN_INVITE_ANSWER = 5
+MAX_INVITE_ANSWER = 2500
+INVITE_PAGE_SIZE = 5
+
+DEFAULT_INVITE_QUESTION = (
+    "اصلی‌ترین چالشِ حل‌نشده‌ی کارت چیه؟ کدوم ابزار، فرایند یا "
+    "کارِ تکراری وقتت رو می‌گیره یا اذیتت می‌کنه و دوست داشتی "
+    "یه راه‌حل ساده براش بود؟ یک مثال واقعی بزن "
+    "(مثلاً یک جوشکار می‌تونه بگه: «عوض‌کردن الکترود کار اضافه‌ست "
+    "و کاش راحت‌تر بود»)."
+)
+
+_bot_username_cache = {}
+
+
+async def get_bot_username() -> str:
+    """The bot's @username (without @), cached after the first call."""
+
+    if "name" not in _bot_username_cache:
+
+        me = await bot.get_me()
+
+        _bot_username_cache["name"] = me.username
+
+    return _bot_username_cache["name"]
+
+
+async def build_invite_link(code: str) -> str:
+
+    username = await get_bot_username()
+
+    return f"https://t.me/{username}?start={code}"
+
+
+def esc(value) -> str:
+    """HTML-escape user-provided text (the bot uses ParseMode.HTML)."""
+
+    return html.escape(str(value or ""))
+
+
+class InviteGateMiddleware(BaseMiddleware):
+    """
+    While a person is answering an invite question, block every
+    button (inline or the persistent bottom keyboard) so they
+    can't skip the question. Plain text (the answer itself) and
+    /start (restarts the question) still go through.
+    """
+
+    async def __call__(self, handler, event, data):
+
+        user = getattr(event, "from_user", None)
+
+        state = get_state(user.id) if user else None
+
+        if state and state.get("step") == "invite_answer":
+
+            if isinstance(event, CallbackQuery):
+
+                await safe_callback_answer(
+                    event,
+                    "🙏 اول لطفاً به سؤال بالا جواب بده.",
+                    show_alert=True
+                )
+
+                return
+
+            if (
+                isinstance(event, Message)
+                and event.text in (
+                    BTN_MAIN_MENU,
+                    BTN_PROFILE,
+                    BTN_SUPPORT
+                )
+            ):
+
+                await event.answer(
+                    "🙏 اول لطفاً به سؤال بالا جواب بده، "
+                    "بعدش می‌تونی از ربات استفاده کنی."
+                )
+
+                return
+
+        return await handler(event, data)
+
+
+dp.message.outer_middleware(InviteGateMiddleware())
+dp.callback_query.outer_middleware(InviteGateMiddleware())
+
+
+async def handle_invite_start(
+    message: Message,
+    code: str
+) -> bool:
+    """
+    Called from /start when the deep-link parameter looks like an
+    invite code. Returns True when the person was put into the
+    "answer the question" step (so /start must NOT show the main
+    menu yet), False when the normal start flow should continue.
+    """
+
+    user = message.from_user
+
+    invite = get_invite_by_code(code)
+
+    if not invite or not invite["is_active"]:
+
+        await message.answer(
+            "⚠️ این لینک دعوت معتبر نیست یا غیرفعال شده است."
+        )
+
+        return False
+
+    if invite["answer"] is not None:
+
+        if invite["answered_by"] == user.id:
+
+            await message.answer(
+                "✅ تو قبلاً به این دعوت جواب دادی. ممنون!"
+            )
+
+        else:
+
+            await message.answer(
+                "⚠️ این لینک دعوت قبلاً استفاده شده است."
+            )
+
+        return False
+
+    increment_invite_opens(invite["id"])
+
+    set_state(
+        user.id,
+        step="invite_answer",
+        invite_id=invite["id"]
+    )
+
+    await message.answer(
+        f"👋 سلام <b>{esc(invite['invited_name'])}</b>!\n\n"
+
+        "به <b>Monopi</b> خوش اومدی. Monopi جاییه برای تبدیل "
+        "مشکلات واقعی آدم‌ها به راه‌حل و کسب‌وکار.\n\n"
+
+        "قبل از شروع، یک سؤال کوتاه ازت داریم. نظر تو "
+        f"به‌عنوان <b>{esc(invite['job_title'])}</b> "
+        "برامون خیلی ارزشمنده:\n\n"
+
+        f"❓ <b>{esc(invite['question'])}</b>\n\n"
+
+        "✍️ جوابت رو همین‌جا به‌صورت متن بفرست."
+    )
+
+    return True
+
+
+# =========================================================
 # START
 # =========================================================
 
 @dp.message(CommandStart())
-async def start_handler(message: Message):
+async def start_handler(
+    message: Message,
+    command: CommandObject
+):
 
     user = message.from_user
 
@@ -785,6 +970,16 @@ async def start_handler(message: Message):
     # مهم:
     # این تابع الان وجود دارد و دیگر NameError نمی‌دهد.
     clear_state(user.id)
+
+    # لینک دعوت: اگر کاربر از لینکی که ادمین ساخته آمده باشد،
+    # اول سؤال دعوت پرسیده می‌شود و منوی اصلی بعد از جواب
+    # (در message_handler، مرحله‌ی invite_answer) نشان داده می‌شود.
+    invite_code = (command.args or "").strip()
+
+    if invite_code.startswith(INVITE_CODE_PREFIX):
+
+        if await handle_invite_start(message, invite_code):
+            return
 
     # پیام اول: فقط برای فعال‌کردن کیبورد ثابت پایین صفحه —
     # یک ReplyKeyboardMarkup تنها روی پیام تازه‌ارسال‌شده جواب
@@ -1520,6 +1715,408 @@ async def admin_users(callback: CallbackQuery):
 
 
 # =========================================================
+# ADMIN — INVITE LINKS
+# =========================================================
+
+def invite_status_icon(invite) -> str:
+
+    if invite["answer"] is not None:
+        return "💬"
+
+    if not invite["is_active"]:
+        return "⛔"
+
+    return "⏳"
+
+
+async def show_invite_list(
+    callback: CallbackQuery,
+    page: int
+):
+
+    total = count_invites()
+
+    pages = max((total + INVITE_PAGE_SIZE - 1) // INVITE_PAGE_SIZE, 1)
+
+    page = min(max(page, 0), pages - 1)
+
+    invites = list_invites(
+        limit=INVITE_PAGE_SIZE,
+        offset=page * INVITE_PAGE_SIZE
+    )
+
+    text = (
+        "🔗 <b>لینک‌های دعوت</b>\n\n"
+        f"تعداد کل: {total}\n"
+        "💬 جواب داده  ⏳ منتظر جواب  ⛔ غیرفعال"
+    )
+
+    if not invites:
+
+        text += (
+            "\n\nهنوز لینکی نساخته‌ای. با دکمه‌ی زیر اولین "
+            "لینک دعوت را بساز."
+        )
+
+    builder = InlineKeyboardBuilder()
+
+    builder.button(
+        text="➕ ساخت لینک جدید",
+        callback_data="invnew"
+    )
+
+    for invite in invites:
+
+        builder.button(
+            text=(
+                f"{invite_status_icon(invite)} "
+                f"#{invite['id']} {invite['invited_name']} — "
+                f"{invite['job_title']}"
+            ),
+            callback_data=f"invview_{invite['id']}_{page}"
+        )
+
+    nav = 0
+
+    if page > 0:
+
+        builder.button(
+            text="⬅️ قبلی",
+            callback_data=f"invlist_{page - 1}"
+        )
+
+        nav += 1
+
+    if page < pages - 1:
+
+        builder.button(
+            text="بعدی ➡️",
+            callback_data=f"invlist_{page + 1}"
+        )
+
+        nav += 1
+
+    builder.button(
+        text="🔙 پنل مدیریت",
+        callback_data="admin_menu"
+    )
+
+    rows = [1] * (1 + len(invites))
+
+    if nav:
+        rows.append(nav)
+
+    rows.append(1)
+
+    builder.adjust(*rows)
+
+    await send_screen(
+        callback,
+        text,
+        builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "admin_invites")
+async def admin_invites(callback: CallbackQuery):
+
+    await safe_callback_answer(callback)
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    clear_state(callback.from_user.id)
+
+    await show_invite_list(callback, 0)
+
+
+@dp.callback_query(F.data.startswith("invlist_"))
+async def admin_invite_list_page(callback: CallbackQuery):
+
+    await safe_callback_answer(callback)
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    try:
+        page = int(callback.data.split("_")[1])
+    except (ValueError, IndexError):
+        page = 0
+
+    clear_state(callback.from_user.id)
+
+    await show_invite_list(callback, page)
+
+
+async def show_invite_detail(
+    callback: CallbackQuery,
+    invite_id: int,
+    page: int
+):
+
+    invite = get_invite(invite_id)
+
+    if not invite:
+
+        await show_invite_list(callback, page)
+
+        return
+
+    link = await build_invite_link(invite["code"])
+
+    if invite["answer"] is not None:
+
+        answerer = get_user(invite["answered_by"])
+
+        if answerer:
+
+            username = (
+                f" (@{answerer['username']})"
+                if answerer["username"]
+                else ""
+            )
+
+            who = f"{esc(answerer['full_name'])}{username}"
+
+        else:
+
+            who = f"ID: {invite['answered_by']}"
+
+        answer_block = (
+            f"💬 <b>جواب</b> — {who}\n"
+            f"🕒 {invite['answered_at']}\n\n"
+            f"{esc(invite['answer'])}"
+        )
+
+    else:
+
+        answer_block = "⏳ هنوز جوابی ثبت نشده."
+
+    status = (
+        "✅ فعال"
+        if invite["is_active"]
+        else "⛔ غیرفعال"
+    )
+
+    text = (
+        f"🔗 <b>دعوت #{invite['id']}</b>  ({status})\n\n"
+
+        f"👤 نام: <b>{esc(invite['invited_name'])}</b>\n"
+        f"💼 عنوان شغلی: <b>{esc(invite['job_title'])}</b>\n\n"
+
+        f"❓ <b>سؤال:</b>\n{esc(invite['question'])}\n\n"
+
+        f"👁 تعداد دفعات باز شدن لینک: "
+        f"{invite['opened_count']}\n"
+        f"📅 ساخته‌شده: {invite['created_at']}\n\n"
+
+        f"🔗 <code>{esc(link)}</code>\n\n"
+
+        f"{answer_block}"
+    )
+
+    builder = InlineKeyboardBuilder()
+
+    if invite["answer"] is None:
+
+        builder.button(
+            text=(
+                "⛔ غیرفعال‌کردن لینک"
+                if invite["is_active"]
+                else "✅ فعال‌کردن لینک"
+            ),
+            callback_data=f"invtoggle_{invite['id']}_{page}"
+        )
+
+    builder.button(
+        text="🔙 لیست لینک‌ها",
+        callback_data=f"invlist_{page}"
+    )
+
+    builder.adjust(1)
+
+    await send_screen(
+        callback,
+        text,
+        builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data.startswith("invview_"))
+async def admin_invite_view(callback: CallbackQuery):
+
+    await safe_callback_answer(callback)
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    try:
+
+        _, invite_id, page = callback.data.split("_")
+
+        invite_id = int(invite_id)
+        page = int(page)
+
+    except ValueError:
+
+        return
+
+    await show_invite_detail(callback, invite_id, page)
+
+
+@dp.callback_query(F.data.startswith("invtoggle_"))
+async def admin_invite_toggle(callback: CallbackQuery):
+
+    await safe_callback_answer(callback)
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    try:
+
+        _, invite_id, page = callback.data.split("_")
+
+        invite_id = int(invite_id)
+        page = int(page)
+
+    except ValueError:
+
+        return
+
+    invite = get_invite(invite_id)
+
+    if invite:
+
+        set_invite_active(
+            invite_id,
+            not invite["is_active"]
+        )
+
+    await show_invite_detail(callback, invite_id, page)
+
+
+# ---------- creating a new invite (3 short steps) ----------
+
+def invite_cancel_markup():
+
+    builder = InlineKeyboardBuilder()
+
+    builder.button(
+        text="❌ لغو",
+        callback_data="admin_invites"
+    )
+
+    return builder.as_markup()
+
+
+@dp.callback_query(F.data == "invnew")
+async def admin_invite_new(callback: CallbackQuery):
+
+    await safe_callback_answer(callback)
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    set_state(
+        callback.from_user.id,
+        step="invite_name"
+    )
+
+    await send_screen(
+        callback,
+
+        "➕ <b>لینک دعوت جدید</b>\n\n"
+        "(۱ از ۳) <b>نام فرد دعوت‌شده</b> را بفرست.\n"
+        "مثال: «رضا احمدی»",
+
+        invite_cancel_markup()
+    )
+
+
+async def finish_invite_creation(
+    admin_id: int,
+    state: dict,
+    question: str
+):
+    """
+    Saves the invite and returns (text, markup) for the result
+    screen. Called from the text step and from the
+    "use default question" button.
+    """
+
+    invite_id, code = create_invite(
+        created_by=admin_id,
+        invited_name=state["invited_name"],
+        job_title=state["job_title"],
+        question=question
+    )
+
+    link = await build_invite_link(code)
+
+    suggested = (
+        f"سلام {state['invited_name']} 👋\n"
+        "می‌خوام نظرت رو درباره‌ی کارت بدونم. لطفاً از این لینک "
+        "وارد ربات Monopi شو و به یک سؤال کوتاه جواب بده:\n"
+        f"{link}"
+    )
+
+    text = (
+        f"✅ <b>لینک دعوت #{invite_id} ساخته شد.</b>\n\n"
+
+        f"👤 {esc(state['invited_name'])}\n"
+        f"💼 {esc(state['job_title'])}\n"
+        f"❓ {esc(question)}\n\n"
+
+        f"🔗 <code>{esc(link)}</code>\n\n"
+
+        "📨 <b>متن پیشنهادی برای ارسال:</b>\n"
+        f"<pre>{esc(suggested)}</pre>"
+    )
+
+    builder = InlineKeyboardBuilder()
+
+    builder.button(
+        text="➕ ساخت لینک دیگر",
+        callback_data="invnew"
+    )
+
+    builder.button(
+        text="🔙 لیست لینک‌ها",
+        callback_data="admin_invites"
+    )
+
+    builder.adjust(1)
+
+    return text, builder.as_markup()
+
+
+@dp.callback_query(F.data == "invdefault")
+async def admin_invite_default_question(callback: CallbackQuery):
+
+    await safe_callback_answer(callback)
+
+    admin_id = callback.from_user.id
+
+    if not is_admin(admin_id):
+        return
+
+    state = get_state(admin_id)
+
+    if not state or state.get("step") != "invite_question":
+        return
+
+    clear_state(admin_id)
+
+    text, markup = await finish_invite_creation(
+        admin_id,
+        state,
+        DEFAULT_INVITE_QUESTION
+    )
+
+    await send_screen(callback, text, markup)
+
+
+# =========================================================
 # CREATE PROBLEM
 # =========================================================
 
@@ -1621,6 +2218,263 @@ async def message_handler(message: Message):
         return
 
     step = state.get("step")
+
+    # =====================================================
+    # INVITE — ADMIN CREATES A LINK (name -> job -> question)
+    # =====================================================
+
+    if step == "invite_name":
+
+        if not is_admin(user_id):
+            clear_state(user_id)
+            return
+
+        if not message.text:
+
+            await message.answer(
+                "⚠️ لطفاً نام را به‌صورت متن بفرست."
+            )
+
+            return
+
+        name = message.text.strip()
+
+        if not name or len(name) > MAX_INVITE_NAME:
+
+            await message.answer(
+                f"⚠️ نام باید بین ۱ تا {MAX_INVITE_NAME} "
+                "کاراکتر باشد."
+            )
+
+            return
+
+        state["invited_name"] = name
+        state["step"] = "invite_job"
+
+        await message.answer(
+            "(۲ از ۳) <b>عنوان شغلی</b> را بفرست.\n"
+            "مثال: «جوشکار»",
+
+            reply_markup=invite_cancel_markup()
+        )
+
+        return
+
+    if step == "invite_job":
+
+        if not is_admin(user_id):
+            clear_state(user_id)
+            return
+
+        if not message.text:
+
+            await message.answer(
+                "⚠️ لطفاً عنوان شغلی را به‌صورت متن بفرست."
+            )
+
+            return
+
+        job = message.text.strip()
+
+        if not job or len(job) > MAX_INVITE_JOB:
+
+            await message.answer(
+                f"⚠️ عنوان شغلی باید بین ۱ تا {MAX_INVITE_JOB} "
+                "کاراکتر باشد."
+            )
+
+            return
+
+        state["job_title"] = job
+        state["step"] = "invite_question"
+
+        builder = InlineKeyboardBuilder()
+
+        builder.button(
+            text="📋 استفاده از سؤال پیش‌فرض (چالش حل‌نشده)",
+            callback_data="invdefault"
+        )
+
+        builder.button(
+            text="❌ لغو",
+            callback_data="admin_invites"
+        )
+
+        builder.adjust(1)
+
+        await message.answer(
+            "(۳ از ۳) <b>صورت سؤال</b> را بفرست؛ همان چیزی که "
+            "کاربر اول از همه می‌بیند.\n\n"
+            "یا سؤال پیش‌فرض را بزن:\n\n"
+            f"<i>{esc(DEFAULT_INVITE_QUESTION)}</i>",
+
+            reply_markup=builder.as_markup()
+        )
+
+        return
+
+    if step == "invite_question":
+
+        if not is_admin(user_id):
+            clear_state(user_id)
+            return
+
+        if not message.text:
+
+            await message.answer(
+                "⚠️ لطفاً سؤال را به‌صورت متن بفرست."
+            )
+
+            return
+
+        question = message.text.strip()
+
+        if len(question) < 5 or len(question) > MAX_INVITE_QUESTION:
+
+            await message.answer(
+                "⚠️ سؤال باید بین ۵ تا "
+                f"{MAX_INVITE_QUESTION} کاراکتر باشد."
+            )
+
+            return
+
+        clear_state(user_id)
+
+        text, markup = await finish_invite_creation(
+            user_id,
+            state,
+            question
+        )
+
+        await message.answer(
+            text,
+            reply_markup=markup
+        )
+
+        return
+
+    # =====================================================
+    # INVITE — NEW PERSON ANSWERS THE QUESTION
+    # =====================================================
+
+    if step == "invite_answer":
+
+        if not message.text:
+
+            await message.answer(
+                "⚠️ لطفاً جوابت رو به‌صورت متن بفرست."
+            )
+
+            return
+
+        answer = message.text.strip()
+
+        if len(answer) < MIN_INVITE_ANSWER:
+
+            await message.answer(
+                "⚠️ جواب خیلی کوتاهه. لطفاً کمی کامل‌تر "
+                "بنویس."
+            )
+
+            return
+
+        if len(answer) > MAX_INVITE_ANSWER:
+
+            await message.answer(
+                "⚠️ جواب خیلی طولانیه "
+                f"({len(answer)} کاراکتر). لطفاً در حداکثر "
+                f"{MAX_INVITE_ANSWER} کاراکتر خلاصه‌اش کن."
+            )
+
+            return
+
+        invite = get_invite(state["invite_id"])
+
+        clear_state(user_id)
+
+        if not invite or not save_invite_answer(
+            invite["id"],
+            user_id,
+            answer
+        ):
+
+            await message.answer(
+                "⚠️ این لینک دعوت دیگر قابل استفاده نیست."
+            )
+
+            await message.answer(
+                "🏠 <b>منوی اصلی Monopi</b>\n\n"
+                "چه کاری می‌خواهی انجام دهی؟",
+
+                reply_markup=main_menu()
+            )
+
+            return
+
+        # ادمین‌ها همان لحظه جواب را می‌بینند
+        sender = message.from_user
+
+        contact = (
+            f" (@{sender.username})"
+            if sender.username
+            else ""
+        )
+
+        admin_text = (
+            f"📬 <b>جواب جدید به دعوت #{invite['id']}</b>\n\n"
+
+            f"👤 {esc(invite['invited_name'])} — "
+            f"💼 {esc(invite['job_title'])}\n"
+            f"از طرف: {esc(sender.full_name)}{contact}\n\n"
+
+            f"❓ {esc(invite['question'])}\n\n"
+
+            f"💬 {esc(answer)}"
+        )
+
+        if len(admin_text) > 4000:
+
+            admin_text = (
+                f"📬 <b>جواب جدید به دعوت #{invite['id']}</b>\n\n"
+
+                f"👤 {esc(invite['invited_name'])} — "
+                f"💼 {esc(invite['job_title'])}\n\n"
+
+                f"💬 {esc(answer)}"
+            )
+
+        for admin_id in ADMIN_IDS:
+
+            try:
+
+                await bot.send_message(
+                    admin_id,
+                    admin_text
+                )
+
+            except Exception:
+
+                logger.warning(
+                    "Could not send invite answer to admin %s",
+                    admin_id
+                )
+
+        await message.answer(
+            "🙏 <b>ممنون که وقت گذاشتی!</b>\n\n"
+            "جوابت ثبت شد و مستقیم به تیم Monopi رسید. "
+            "از این لحظه می‌تونی از ربات استفاده کنی.",
+
+            reply_markup=persistent_keyboard()
+        )
+
+        await message.answer(
+            "🏠 <b>منوی اصلی Monopi</b>\n\n"
+            "چه کاری می‌خواهی انجام دهی؟",
+
+            reply_markup=main_menu()
+        )
+
+        return
 
     # =====================================================
     # EDIT SKILLS
