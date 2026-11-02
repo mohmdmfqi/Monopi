@@ -2,6 +2,7 @@ import logging
 import os
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -28,6 +29,12 @@ logger = logging.getLogger("monopi.database")
 # Locally (no DB_PATH set) it just falls back to a file in the
 # project folder, which is fine for development.
 
+# Other hosts (Pterodactyl-style panels such as Botkeep): the server
+# folder normally survives restarts, but a redeploy / re-upload can
+# still replace or clean it. Two layers protect the data:
+#   * keep the DB in its own folder, e.g. DB_PATH=data/monopi_v2.db
+#   * rely on the Telegram backups below (BACKUP_INTERVAL_HOURS) --
+#     the admin receives the .db file in chat and can /restore it.
 DB_PATH = os.getenv("DB_PATH", "monopi_v2.db")
 
 _db_dir = os.path.dirname(DB_PATH)
@@ -1627,3 +1634,167 @@ def get_collaboration_ratings(
         ))
 
         return cursor.fetchall()
+
+
+# =========================================================
+# BACKUP / RESTORE
+# =========================================================
+# create_backup() makes a consistent snapshot of the live database
+# with SQLite's online backup API (safe while the bot is running,
+# WAL included). The bot sends these files to the admins in
+# Telegram, so a copy of the data always lives OUTSIDE the host.
+# restore_from_file() loads such a file back in.
+
+BACKUP_DIR = os.getenv("BACKUP_DIR", "").strip() or os.path.join(
+    os.path.dirname(os.path.abspath(DB_PATH)),
+    "backups",
+)
+
+try:
+    BACKUP_KEEP = max(1, int(os.getenv("BACKUP_KEEP", "10")))
+except ValueError:
+    BACKUP_KEEP = 10
+
+REQUIRED_TABLES = ("users", "problems", "solutions")
+
+
+class BackupError(Exception):
+    """A backup file is unusable. The message is user-facing (Persian)."""
+
+
+def _prune_backups(prefix, keep):
+
+    try:
+        files = sorted(
+            f for f in os.listdir(BACKUP_DIR)
+            if f.startswith(prefix + "_") and f.endswith(".db")
+        )
+    except OSError:
+        return
+
+    for old_name in files[:-keep]:
+        try:
+            os.remove(os.path.join(BACKUP_DIR, old_name))
+        except OSError:
+            logger.warning("Could not delete old backup %s", old_name)
+
+
+def create_backup(prefix="monopi_backup"):
+    """Snapshot the live DB into BACKUP_DIR; returns the file path."""
+
+    Path(BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(BACKUP_DIR, f"{prefix}_{stamp}.db")
+
+    src = sqlite3.connect(DB_PATH, timeout=30)
+
+    try:
+
+        dst = sqlite3.connect(path)
+
+        try:
+            src.backup(dst)
+            # single self-contained file (no -wal/-shm beside it)
+            dst.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            dst.close()
+
+    finally:
+        src.close()
+
+    _prune_backups(prefix, BACKUP_KEEP if prefix == "monopi_backup" else 5)
+
+    logger.info("Backup created: %s", path)
+
+    return path
+
+
+def inspect_backup_file(path):
+    """
+    Validate a candidate backup file and return its row counts.
+    Raises BackupError (Persian message) if it is not a usable
+    Monopi database.
+    """
+
+    try:
+
+        conn = sqlite3.connect(
+            Path(path).resolve().as_uri() + "?mode=ro",
+            uri=True,
+            timeout=10,
+        )
+
+    except sqlite3.Error:
+        raise BackupError("فایل قابل باز شدن نیست.")
+
+    try:
+
+        try:
+
+            check = conn.execute("PRAGMA integrity_check").fetchone()[0]
+
+            tables = {
+                row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+
+        except sqlite3.DatabaseError:
+            raise BackupError("این فایل یک دیتابیس SQLite معتبر نیست.")
+
+        if check != "ok":
+            raise BackupError("فایل آسیب دیده است (integrity check ناموفق).")
+
+        missing = [t for t in REQUIRED_TABLES if t not in tables]
+
+        if missing:
+            raise BackupError(
+                "این فایل دیتابیس Monopi نیست (جدول‌های اصلی را ندارد)."
+            )
+
+        return {
+            "users": conn.execute(
+                "SELECT COUNT(*) FROM users").fetchone()[0],
+            "problems": conn.execute(
+                "SELECT COUNT(*) FROM problems").fetchone()[0],
+            "solutions": conn.execute(
+                "SELECT COUNT(*) FROM solutions").fetchone()[0],
+        }
+
+    finally:
+        conn.close()
+
+
+def restore_from_file(path):
+    """
+    Replace the live database content with the backup at `path`.
+    A safety copy of the CURRENT database is made first
+    (prefix "pre_restore"). Returns (counts_of_backup, safety_path).
+    """
+
+    info = inspect_backup_file(path)
+
+    safety = create_backup(prefix="pre_restore")
+
+    src = sqlite3.connect(path)
+
+    try:
+
+        dst = sqlite3.connect(DB_PATH, timeout=30)
+
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+
+    finally:
+        src.close()
+
+    # An older backup may lack newer tables/columns -- re-run the
+    # idempotent schema setup/migrations.
+    init_db()
+
+    logger.info("Database restored from %s (safety copy: %s)", path, safety)
+
+    return info, safety
