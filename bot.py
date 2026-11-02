@@ -1,8 +1,10 @@
 import asyncio
 import logging
 import os
+import shutil
 import signal
 import sys
+import tempfile
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -14,6 +16,7 @@ from aiogram.exceptions import (
 from aiogram.filters import CommandStart
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     KeyboardButton,
     Message,
     ReplyKeyboardMarkup,
@@ -23,6 +26,10 @@ from dotenv import load_dotenv
 
 from database import (
     DB_PATH,
+    BackupError,
+    create_backup,
+    inspect_backup_file,
+    restore_from_file,
     init_db,
 
     # Users
@@ -147,6 +154,18 @@ DROP_PENDING_UPDATES = os.getenv(
     "DROP_PENDING_UPDATES",
     "true"
 ).strip().lower() in ("1", "true", "yes")
+
+
+# How often (hours) a fresh database backup file is sent to every
+# admin in Telegram. This keeps a copy of all users/problems/
+# solutions OUTSIDE the hosting server, so a wiped server never
+# means lost data (restore it with /restore). 0 disables it.
+try:
+    BACKUP_INTERVAL_HOURS = float(
+        os.getenv("BACKUP_INTERVAL_HOURS", "6")
+    )
+except ValueError:
+    BACKUP_INTERVAL_HOURS = 6.0
 
 
 def is_admin(user_id: int) -> bool:
@@ -734,6 +753,11 @@ def admin_menu():
     )
 
     builder.button(
+        text="💾 پشتیبان‌گیری از دیتابیس",
+        callback_data="admin_backup"
+    )
+
+    builder.button(
         text="🏠 منوی اصلی",
         callback_data="main_menu"
     )
@@ -848,6 +872,362 @@ async def admin_command(message: Message):
         "بخش موردنظر را انتخاب کن:",
         reply_markup=admin_menu()
     )
+
+
+# =========================================================
+# DATABASE BACKUP / RESTORE  (admin only)
+# =========================================================
+# /backup   -> bot sends the current database file.
+# /restore  -> send a .db backup file as a document with the
+#              caption  /restore  ; the bot validates it, shows a
+#              comparison and asks for confirmation.
+# A fresh backup is also sent to every admin automatically every
+# BACKUP_INTERVAL_HOURS (default 6). These handlers are registered
+# before the bare @dp.message() catch-all on purpose.
+
+# admin_id -> path of an uploaded backup waiting for confirmation
+_pending_restore = {}
+
+
+def _data_summary():
+
+    s = get_admin_stats()
+
+    return (
+        f"👤 کاربران: {s['users']}\n"
+        f"💡 مسائل: {s['problems_total']}\n"
+        f"💭 راه‌حل‌ها: {s['solutions_total']}"
+    )
+
+
+async def send_backup_document(chat_id):
+
+    path = await asyncio.to_thread(create_backup)
+
+    await bot.send_document(
+        chat_id,
+        FSInputFile(path),
+        caption=(
+            "💾 <b>پشتیبان دیتابیس Monopi</b>\n\n"
+            + _data_summary()
+            + "\n\nاین فایل را نگه دار. برای بازیابی، همین فایل را "
+              "با کپشن /restore برای ربات بفرست."
+        )
+    )
+
+
+@dp.message(F.text == "/backup")
+async def backup_command(message: Message):
+
+    if not is_admin(message.from_user.id):
+
+        await message.answer("⛔ دسترسی غیرمجاز.")
+
+        return
+
+    try:
+
+        await send_backup_document(message.chat.id)
+
+    except Exception:
+
+        logger.exception("Manual backup failed")
+
+        await message.answer("❌ ساخت فایل پشتیبان ناموفق بود.")
+
+
+@dp.callback_query(F.data == "admin_backup")
+async def admin_backup(callback: CallbackQuery):
+
+    await safe_callback_answer(callback)
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    try:
+
+        await send_backup_document(callback.from_user.id)
+
+    except Exception:
+
+        logger.exception("Manual backup failed")
+
+        await callback.message.answer("❌ ساخت فایل پشتیبان ناموفق بود.")
+
+
+def _is_restore_upload(message: Message) -> bool:
+
+    return bool(
+        message.document
+        and (message.caption or "").strip().lower().startswith("/restore")
+    )
+
+
+@dp.message(F.func(_is_restore_upload))
+async def restore_upload_handler(message: Message):
+
+    admin_id = message.from_user.id
+
+    if not is_admin(admin_id):
+
+        await message.answer("⛔ دسترسی غیرمجاز.")
+
+        return
+
+    doc = message.document
+
+    if doc.file_size and doc.file_size > 20 * 1024 * 1024:
+
+        await message.answer(
+            "❌ فایل بزرگ‌تر از ۲۰ مگابایت است و تلگرام اجازه‌ی "
+            "دانلودش را به ربات نمی‌دهد."
+        )
+
+        return
+
+    tmp_dir = tempfile.mkdtemp(prefix="monopi_restore_")
+    tmp_path = os.path.join(tmp_dir, "upload.db")
+
+    try:
+
+        await bot.download(doc, destination=tmp_path)
+
+        info = await asyncio.to_thread(inspect_backup_file, tmp_path)
+
+    except BackupError as e:
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        await message.answer(f"❌ {e}")
+
+        return
+
+    except Exception:
+
+        logger.exception("Restore upload failed")
+
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        await message.answer("❌ دریافت یا بررسی فایل ناموفق بود.")
+
+        return
+
+    # replace an older pending upload from the same admin
+    old = _pending_restore.pop(admin_id, None)
+
+    if old:
+        shutil.rmtree(os.path.dirname(old), ignore_errors=True)
+
+    _pending_restore[admin_id] = tmp_path
+
+    cur = get_admin_stats()
+
+    builder = InlineKeyboardBuilder()
+
+    builder.button(
+        text="✅ تأیید بازیابی",
+        callback_data="restore_confirm"
+    )
+
+    builder.button(
+        text="❌ انصراف",
+        callback_data="restore_cancel"
+    )
+
+    builder.adjust(1)
+
+    await message.answer(
+        "♻️ <b>بازیابی دیتابیس</b>\n\n"
+        "<b>محتوای فایل:</b>\n"
+        f"👤 کاربران: {info['users']}\n"
+        f"💡 مسائل: {info['problems']}\n"
+        f"💭 راه‌حل‌ها: {info['solutions']}\n\n"
+        "<b>دیتابیس فعلی:</b>\n"
+        f"👤 کاربران: {cur['users']}\n"
+        f"💡 مسائل: {cur['problems_total']}\n"
+        f"💭 راه‌حل‌ها: {cur['solutions_total']}\n\n"
+        "⚠️ با تأیید، داده‌ی فعلی با محتوای فایل جایگزین می‌شود "
+        "(یک نسخه‌ی ایمنی از وضعیت فعلی قبلش ساخته می‌شود).",
+        reply_markup=builder.as_markup()
+    )
+
+
+@dp.callback_query(F.data == "restore_cancel")
+async def restore_cancel(callback: CallbackQuery):
+
+    await safe_callback_answer(callback)
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    path = _pending_restore.pop(callback.from_user.id, None)
+
+    if path:
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await callback.message.answer("بازیابی لغو شد.")
+
+
+@dp.callback_query(F.data == "restore_confirm")
+async def restore_confirm(callback: CallbackQuery):
+
+    await safe_callback_answer(callback)
+
+    if not is_admin(callback.from_user.id):
+        return
+
+    path = _pending_restore.pop(callback.from_user.id, None)
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if not path or not os.path.exists(path):
+
+        await callback.message.answer(
+            "این درخواست منقضی شده است. فایل را دوباره با "
+            "کپشن /restore بفرست."
+        )
+
+        return
+
+    try:
+
+        info, safety = await asyncio.to_thread(restore_from_file, path)
+
+    except BackupError as e:
+
+        await callback.message.answer(f"❌ {e}")
+
+        return
+
+    except Exception:
+
+        logger.exception("Restore failed")
+
+        await callback.message.answer(
+            "❌ بازیابی ناموفق بود. دیتابیس فعلی دست‌نخورده می‌ماند "
+            "یا از نسخه‌ی ایمنی قابل بازگشت است."
+        )
+
+        return
+
+    finally:
+
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+
+    # conversation steps held in memory refer to the old data
+    user_states.clear()
+
+    await callback.message.answer(
+        "✅ <b>دیتابیس بازیابی شد.</b>\n\n"
+        + _data_summary()
+    )
+
+
+async def broadcast_backup_to_admins():
+
+    s = get_admin_stats()
+
+    # nothing worth protecting yet -> don't spam the admins
+    if s["users"] == 0 and s["problems_total"] == 0:
+        return
+
+    try:
+
+        path = await asyncio.to_thread(create_backup)
+
+    except Exception:
+
+        logger.exception("Scheduled backup failed")
+
+        return
+
+    caption = (
+        "💾 <b>پشتیبان خودکار Monopi</b>\n\n"
+        + _data_summary()
+        + "\n\nبرای بازیابی: همین فایل را با کپشن /restore بفرست."
+    )
+
+    for admin_id in ADMIN_IDS:
+
+        try:
+
+            await bot.send_document(
+                admin_id,
+                FSInputFile(path),
+                caption=caption
+            )
+
+        except Exception:
+
+            logger.warning(
+                "Could not send backup to admin %s", admin_id
+            )
+
+
+async def backup_loop():
+
+    if BACKUP_INTERVAL_HOURS <= 0 or not ADMIN_IDS:
+
+        logger.info("Automatic backups are disabled.")
+
+        return
+
+    logger.info(
+        "Automatic backups every %s hour(s).", BACKUP_INTERVAL_HOURS
+    )
+
+    # small delay so the bot is fully up before the first send
+    await asyncio.sleep(60)
+
+    while True:
+
+        try:
+            await broadcast_backup_to_admins()
+        except Exception:
+            logger.exception("Backup loop iteration failed")
+
+        await asyncio.sleep(BACKUP_INTERVAL_HOURS * 3600)
+
+
+async def notify_admins_startup():
+
+    try:
+
+        text = (
+            "🟢 <b>ربات Monopi راه‌اندازی شد.</b>\n\n"
+            + _data_summary()
+        )
+
+        s = get_admin_stats()
+
+        if s["users"] == 0 and s["problems_total"] == 0:
+
+            text += (
+                "\n\n⚠️ دیتابیس خالی است. اگر قبلاً داده داشتی، "
+                "آخرین فایل پشتیبان را با کپشن /restore برای ربات "
+                "بفرست."
+            )
+
+        for admin_id in ADMIN_IDS:
+
+            try:
+                await bot.send_message(admin_id, text)
+            except Exception:
+                logger.warning(
+                    "Could not notify admin %s", admin_id
+                )
+
+    except Exception:
+
+        logger.exception("Startup notification failed")
 
 
 @dp.callback_query(F.data == "admin_menu")
@@ -5027,6 +5407,11 @@ async def main():
     init_db()
     logger.info("Database ready at: %s", DB_PATH)
 
+    background_tasks = [
+        asyncio.create_task(backup_loop()),
+        asyncio.create_task(notify_admins_startup()),
+    ]
+
     # Let Railway's SIGTERM (sent on redeploy / manual restart /
     # scale-down) stop polling cleanly instead of killing the
     # process mid-request after the grace period expires.
@@ -5103,6 +5488,9 @@ async def main():
                 backoff = min(backoff * 2, max_backoff)
 
     finally:
+
+        for task in background_tasks:
+            task.cancel()
 
         logger.info("Closing bot session...")
 
