@@ -23,3 +23,5 @@ env/
 Thumbs.db
 .vscode/
 .idea/
+# Local database backups (the bot also sends them to the admins in Telegram)
+backups/
